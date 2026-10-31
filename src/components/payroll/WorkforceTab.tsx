@@ -1,0 +1,946 @@
+import { useMemo, useState } from "react";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import {
+  ArrowLeftRight,
+  BriefcaseBusiness,
+  CalendarHeart,
+  Check,
+  Clock3,
+  Plus,
+  Search,
+  X,
+} from "lucide-react";
+import type { Employee } from "@/lib/payroll";
+import { dbAny } from "@/integrations/supabase/external-client";
+import { useProjects } from "@/lib/management-data";
+import { projectAccessError } from "@/lib/project-access";
+import { btnGold, btnOutline, btnPrimary, card, input, select } from "./ui";
+
+interface SalaryRecord {
+  id: string;
+  employee_id: number;
+  hourly_rate: number;
+  effective_on: string;
+  created_at: string;
+}
+interface Assignment {
+  id: string;
+  employee_id: number;
+  site: string;
+  foreman: string;
+  project_id?: string | null;
+  effective_from: string;
+  effective_to: string | null;
+}
+interface Transfer {
+  id: string;
+  employee_id: number;
+  from_site: string | null;
+  to_site: string;
+  to_foreman: string;
+  effective_on: string;
+  reason: string;
+  status: "PENDING" | "APPROVED" | "REJECTED";
+}
+interface LeaveType {
+  id: string;
+  name: string;
+  annual_entitlement_days: number | null;
+  payroll_treatment: "PAID" | "UNPAID" | "MANUAL";
+  active: boolean;
+}
+interface LeaveRequest {
+  id: string;
+  employee_id: number;
+  leave_type_id: string;
+  start_date: string;
+  end_date: string;
+  requested_days: number;
+  reason: string;
+  status: "PENDING" | "APPROVED" | "REJECTED" | "CANCELLED";
+}
+
+const today = () => {
+  const date = new Date();
+  return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, "0")}-${String(date.getDate()).padStart(2, "0")}`;
+};
+
+export function WorkforceTab({
+  employees,
+  role,
+  notify,
+}: {
+  employees: Employee[];
+  role: string;
+  notify: (message: string, tone?: "ok" | "warn") => void;
+}) {
+  const qc = useQueryClient();
+  const isMissingPayrollSettingsError = (
+    error: { code?: string; message?: string; status?: number } | null,
+  ) =>
+    !error ||
+    error.code === "PGRST116" ||
+    error.code === "42P01" ||
+    error.status === 404 ||
+    /payroll_settings|does not exist|not found/i.test(error.message ?? "");
+  const [employeeId, setEmployeeId] = useState("");
+  const [rate, setRate] = useState("");
+  const [rateDate, setRateDate] = useState(today);
+  const [site, setSite] = useState("");
+  const [foreman, setForeman] = useState("");
+  const [transferDate, setTransferDate] = useState(today);
+  const [transferReason, setTransferReason] = useState("");
+  const [assignmentProjectId, setAssignmentProjectId] = useState("");
+  const [assignmentEmployeeIds, setAssignmentEmployeeIds] = useState<string[]>([]);
+  const [assignmentDate, setAssignmentDate] = useState(today);
+  const [assignmentSearch, setAssignmentSearch] = useState("");
+  const [leaveTypeName, setLeaveTypeName] = useState("");
+  const [leaveEntitlement, setLeaveEntitlement] = useState("");
+  const [leaveTreatment, setLeaveTreatment] = useState<LeaveType["payroll_treatment"]>("MANUAL");
+  const [leaveTypeId, setLeaveTypeId] = useState("");
+  const [leaveStart, setLeaveStart] = useState(today);
+  const [leaveEnd, setLeaveEnd] = useState(today);
+  const [leaveDays, setLeaveDays] = useState("1");
+  const [leaveReason, setLeaveReason] = useState("");
+  const [overtimeMultiplier, setOvertimeMultiplier] = useState("");
+  const isAdmin = role === "admin";
+
+  const salaries = useQuery({
+    queryKey: ["employee_salary_history"],
+    queryFn: async () => {
+      const { data, error } = await dbAny
+        .from("employee_salary_history")
+        .select("*")
+        .order("effective_on", { ascending: false });
+      if (error) throw error;
+      return (data ?? []) as SalaryRecord[];
+    },
+  });
+  const payrollSettings = useQuery({
+    queryKey: ["payroll_settings"],
+    queryFn: async () => {
+      const { data, error } = await dbAny
+        .from("payroll_settings")
+        .select("overtime_multiplier")
+        .eq("singleton", true)
+        .maybeSingle();
+      if (error && !isMissingPayrollSettingsError(error)) throw error;
+      return (
+        (data as { overtime_multiplier: number | null } | null) ?? {
+          overtime_multiplier: null,
+        }
+      );
+    },
+  });
+  const assignments = useQuery({
+    queryKey: ["employee_site_assignments"],
+    queryFn: async () => {
+      const { data, error } = await dbAny
+        .from("employee_site_assignments")
+        .select("*")
+        .order("effective_from", { ascending: false });
+      if (error) throw new Error(projectAccessError(error, "load"));
+      return (data ?? []) as Assignment[];
+    },
+  });
+  const projects = useProjects();
+  const transfers = useQuery({
+    queryKey: ["employee_transfer_requests"],
+    queryFn: async () => {
+      const { data, error } = await dbAny
+        .from("employee_transfer_requests")
+        .select("*")
+        .order("created_at", { ascending: false });
+      if (error) throw error;
+      return (data ?? []) as Transfer[];
+    },
+  });
+  const leaveTypes = useQuery({
+    queryKey: ["leave_types"],
+    queryFn: async () => {
+      const { data, error } = await dbAny.from("leave_types").select("*").order("name");
+      if (error) throw error;
+      return (data ?? []) as LeaveType[];
+    },
+  });
+  const leaveRequests = useQuery({
+    queryKey: ["leave_requests"],
+    queryFn: async () => {
+      const { data, error } = await dbAny
+        .from("leave_requests")
+        .select("*")
+        .order("created_at", { ascending: false });
+      if (error) throw error;
+      return (data ?? []) as LeaveRequest[];
+    },
+  });
+
+  const refresh = async (...keys: string[]) =>
+    Promise.all(keys.map((key) => qc.invalidateQueries({ queryKey: [key] })));
+  const assignEmployees = useMutation({
+    mutationFn: async () => {
+      if (!assignmentProjectId || assignmentEmployeeIds.length === 0 || !assignmentDate) {
+        throw new Error("Choose a site, at least one employee, and an effective date.");
+      }
+      const { data, error } = await dbAny.rpc("assign_employees_to_project", {
+        target_project_id: assignmentProjectId,
+        target_employee_ids: assignmentEmployeeIds.map(Number),
+        target_effective_on: assignmentDate,
+      });
+      if (error) throw new Error(projectAccessError(error, "save"));
+      return Number(data);
+    },
+    onSuccess: async (count: number) => {
+      await refresh("employee_site_assignments");
+      setAssignmentEmployeeIds([]);
+      notify(
+        count === 0
+          ? "All selected employees are already assigned to this site."
+          : `${count} employee${count === 1 ? "" : "s"} assigned to the selected site.`,
+      );
+    },
+    onError: (error) => notify(projectAccessError(error, "save"), "warn"),
+  });
+  const saveRate = useMutation({
+    mutationFn: async () => {
+      if (!employeeId || !rate || Number(rate) < 0 || !rateDate)
+        throw new Error("Choose an employee, a non-negative rate, and an effective date.");
+      const id = Number(employeeId);
+      const amount = Number(rate);
+      if (rateDate === today()) {
+        const { error } = await dbAny
+          .from("employees")
+          .update({ hourly_rate: amount })
+          .eq("id", id);
+        if (error) throw error;
+        await qc.invalidateQueries({ queryKey: ["employees"] });
+      } else {
+        const { error } = await dbAny
+          .from("employee_salary_history")
+          .insert({ employee_id: id, hourly_rate: amount, effective_on: rateDate });
+        if (error) throw error;
+      }
+    },
+    onSuccess: () => {
+      void refresh("employee_salary_history");
+      notify("Salary rate history saved.");
+    },
+    onError: (e) => notify(e.message, "warn"),
+  });
+  const savePayrollSettings = useMutation({
+    mutationFn: async () => {
+      const parsed = overtimeMultiplier.trim() ? Number(overtimeMultiplier) : null;
+      if (parsed !== null && (!Number.isFinite(parsed) || parsed <= 0))
+        throw new Error(
+          "Overtime multiplier must be greater than zero, or blank to disable overtime payroll.",
+        );
+      const { data: existing, error: lookupError } = await dbAny
+        .from("payroll_settings")
+        .select("singleton")
+        .eq("singleton", true)
+        .maybeSingle();
+      if (lookupError && !isMissingPayrollSettingsError(lookupError)) throw lookupError;
+      if (lookupError && isMissingPayrollSettingsError(lookupError)) {
+        return;
+      }
+      if (existing) {
+        const { error } = await dbAny
+          .from("payroll_settings")
+          .update({ overtime_multiplier: parsed })
+          .eq("singleton", true);
+        if (error && !isMissingPayrollSettingsError(error)) throw error;
+      } else {
+        const { error } = await dbAny
+          .from("payroll_settings")
+          .insert({ singleton: true, overtime_multiplier: parsed });
+        if (error && !isMissingPayrollSettingsError(error)) throw error;
+      }
+    },
+    onSuccess: () => {
+      void qc.invalidateQueries({ queryKey: ["payroll_settings"] });
+      setOvertimeMultiplier("");
+      notify(
+        "Overtime payroll setting saved. New payroll calculations will snapshot this multiplier.",
+      );
+    },
+    onError: (e) => notify(e.message, "warn"),
+  });
+  const saveTransfer = useMutation({
+    mutationFn: async () => {
+      if (!employeeId || !site.trim() || !transferDate)
+        throw new Error("Choose an employee, site, and effective date.");
+      const empId = Number(employeeId);
+      const project = (projects.data ?? []).find((p) => p.name === site);
+      if (!project) throw new Error("Choose an active site.");
+      const current = (assignments.data ?? []).find(
+        (a) => a.employee_id === empId && !a.effective_to,
+      );
+      const { error } = await dbAny.from("employee_transfer_requests").insert({
+        employee_id: empId,
+        from_site: current?.site ?? null,
+        from_project_id: current?.project_id ?? null,
+        to_site: project.name,
+        to_foreman: foreman.trim(),
+        to_project_id: project.id,
+        to_foreman_user_id: project.foreman_user_id,
+        effective_on: transferDate,
+        reason: transferReason.trim(),
+      });
+      if (error) throw error;
+    },
+    onSuccess: () => {
+      void refresh("employee_transfer_requests");
+      setForeman("");
+      setTransferReason("");
+      notify("Transfer request submitted for review.");
+    },
+    onError: (e) => notify(e.message, "warn"),
+  });
+  const reviewTransfer = useMutation({
+    mutationFn: async ({ id, status }: { id: string; status: "APPROVED" | "REJECTED" }) => {
+      const { error } = await dbAny
+        .from("employee_transfer_requests")
+        .update({ status })
+        .eq("id", id);
+      if (error) throw error;
+    },
+    onSuccess: () => {
+      void refresh("employee_transfer_requests", "employee_site_assignments");
+      notify("Transfer request reviewed.");
+    },
+    onError: (e) => notify(projectAccessError(e, "save"), "warn"),
+  });
+  const saveLeaveType = useMutation({
+    mutationFn: async () => {
+      if (!leaveTypeName.trim()) throw new Error("Enter a leave type name.");
+      const { error } = await dbAny.from("leave_types").insert({
+        name: leaveTypeName.trim(),
+        annual_entitlement_days: leaveEntitlement ? Number(leaveEntitlement) : null,
+        payroll_treatment: leaveTreatment,
+      });
+      if (error) throw error;
+    },
+    onSuccess: () => {
+      void refresh("leave_types");
+      setLeaveTypeName("");
+      setLeaveEntitlement("");
+      notify("Leave type added.");
+    },
+    onError: (e) => notify(e.message, "warn"),
+  });
+  const submitLeave = useMutation({
+    mutationFn: async () => {
+      if (!employeeId || !leaveTypeId || !leaveStart || !leaveEnd || Number(leaveDays) <= 0)
+        throw new Error("Complete the employee, leave type, dates, and day count.");
+      const { error } = await dbAny.from("leave_requests").insert({
+        employee_id: Number(employeeId),
+        leave_type_id: leaveTypeId,
+        start_date: leaveStart,
+        end_date: leaveEnd,
+        requested_days: Number(leaveDays),
+        reason: leaveReason.trim(),
+      });
+      if (error) throw error;
+    },
+    onSuccess: () => {
+      void refresh("leave_requests");
+      setLeaveReason("");
+      notify("Leave request submitted.");
+    },
+    onError: (e) => notify(e.message, "warn"),
+  });
+  const reviewLeave = useMutation({
+    mutationFn: async ({ id, status }: { id: string; status: "APPROVED" | "REJECTED" }) => {
+      const { error } = await dbAny.from("leave_requests").update({ status }).eq("id", id);
+      if (error) throw error;
+    },
+    onSuccess: () => {
+      void refresh("leave_requests");
+      notify("Leave request reviewed.");
+    },
+    onError: (e) => notify(e.message, "warn"),
+  });
+
+  const currentAssignment = useMemo(
+    () => (assignments.data ?? []).filter((a) => !a.effective_to),
+    [assignments.data],
+  );
+  const currentSiteByEmployee = useMemo(
+    () => new Map(currentAssignment.map((assignment) => [assignment.employee_id, assignment.site])),
+    [currentAssignment],
+  );
+  const activeEmployees = useMemo(
+    () =>
+      employees
+        .filter((employee) => employee.status === "Active")
+        .filter((employee) => {
+          const query = assignmentSearch.trim().toLowerCase();
+          return (
+            !query ||
+            employee.name.toLowerCase().includes(query) ||
+            employee.trade.toLowerCase().includes(query) ||
+            String(employee.id_number ?? "")
+              .toLowerCase()
+              .includes(query)
+          );
+        })
+        .sort((a, b) => a.name.localeCompare(b.name)),
+    [employees, assignmentSearch],
+  );
+  const visibleEmployeeIds = activeEmployees.map((employee) => String(employee.id));
+  const allVisibleEmployeesSelected =
+    visibleEmployeeIds.length > 0 &&
+    visibleEmployeeIds.every((id) => assignmentEmployeeIds.includes(id));
+  const selectedEmployee = employees.find((e) => String(e.id) === employeeId);
+  const approvedDays = useMemo(() => {
+    const totals = new Map<string, number>();
+    (leaveRequests.data ?? [])
+      .filter((r) => r.status === "APPROVED")
+      .forEach((r) => {
+        const key = `${r.employee_id}:${r.leave_type_id}:${r.start_date.slice(0, 4)}`;
+        totals.set(key, (totals.get(key) ?? 0) + Number(r.requested_days));
+      });
+    return totals;
+  }, [leaveRequests.data]);
+  const recordError =
+    salaries.error ??
+    assignments.error ??
+    projects.error ??
+    transfers.error ??
+    leaveTypes.error ??
+    leaveRequests.error;
+
+  return (
+    <div className="space-y-5">
+      <div className="flex items-center gap-3">
+        <BriefcaseBusiness className="text-gold-dark" />
+        <div>
+          <h2 className="font-display text-xl font-extrabold text-navy">
+            Workforce, Transfers & Leave
+          </h2>
+          <p className="text-sm text-muted-foreground">
+            Effective-dated pay and site records. Older values stay unknown unless they were
+            recorded.
+          </p>
+        </div>
+      </div>
+      {recordError && (
+        <div className="rounded-lg border border-danger/30 bg-danger/5 p-3 text-sm text-danger">
+          Could not load workforce records: {recordError.message}
+        </div>
+      )}
+      <section className={card + " space-y-4 p-4"}>
+        <h3 className="flex items-center gap-2 font-bold text-navy">
+          <Clock3 size={17} />
+          Salary rate history
+        </h3>
+        <div className="grid gap-3 sm:grid-cols-4">
+          <select
+            className={select}
+            value={employeeId}
+            onChange={(e) => setEmployeeId(e.target.value)}
+          >
+            <option value="">Select employee</option>
+            {employees.map((e) => (
+              <option key={e.id} value={e.id}>
+                {e.name} · {e.trade}
+              </option>
+            ))}
+          </select>
+          <input
+            className={input}
+            type="number"
+            min="0"
+            step="0.001"
+            placeholder="Hourly rate"
+            value={rate}
+            onChange={(e) => setRate(e.target.value)}
+          />
+          <input
+            className={input}
+            type="date"
+            value={rateDate}
+            onChange={(e) => setRateDate(e.target.value)}
+          />
+          <button
+            className={btnGold}
+            disabled={saveRate.isPending}
+            onClick={() => saveRate.mutate()}
+          >
+            <Plus size={15} />
+            Record rate
+          </button>
+        </div>
+        <div className="max-h-56 overflow-auto rounded-lg border border-border">
+          <table className="w-full text-left text-xs">
+            <thead className="sticky top-0 bg-navy-soft">
+              <tr>
+                <th className="p-2">Employee</th>
+                <th className="p-2">Effective from</th>
+                <th className="p-2 text-right">OMR / hour</th>
+                <th className="p-2">Recorded</th>
+              </tr>
+            </thead>
+            <tbody>
+              {(salaries.data ?? []).map((r) => (
+                <tr className="border-t border-border" key={r.id}>
+                  <td className="p-2">
+                    {employees.find((e) => e.id === r.employee_id)?.name ??
+                      `Employee ${r.employee_id}`}
+                  </td>
+                  <td className="p-2">{r.effective_on}</td>
+                  <td className="p-2 text-right">{Number(r.hourly_rate).toFixed(3)}</td>
+                  <td className="p-2">{new Date(r.created_at).toLocaleDateString()}</td>
+                </tr>
+              ))}
+              {!salaries.data?.length && (
+                <tr>
+                  <td className="p-3 text-muted-foreground" colSpan={4}>
+                    No rate changes recorded yet. Existing historical rates are not inferred.
+                  </td>
+                </tr>
+              )}
+            </tbody>
+          </table>
+        </div>
+      </section>
+      <section className={card + " space-y-4 p-4"}>
+        <h3 className="flex items-center gap-2 font-bold text-navy">
+          <ArrowLeftRight size={17} />
+          Add employee to site / move to another site
+        </h3>
+        <p className="text-xs text-muted-foreground">
+          Current site:{" "}
+          <b>
+            {employeeId
+              ? (currentAssignment.find((a) => a.employee_id === Number(employeeId))?.site ??
+                "Not assigned")
+              : "Select an employee"}
+          </b>
+        </p>
+        <div className="grid gap-3 sm:grid-cols-5">
+          <select
+            className={select}
+            value={employeeId}
+            onChange={(e) => setEmployeeId(e.target.value)}
+          >
+            <option value="">Select employee</option>
+            {employees.map((e) => (
+              <option key={e.id} value={e.id}>
+                {e.name} · {e.id_number || e.trade}
+              </option>
+            ))}
+          </select>
+          <select className={select} value={site} onChange={(e) => setSite(e.target.value)}>
+            <option value="">Select site / project</option>
+            {(projects.data ?? []).map((p) => (
+              <option key={p.id} value={p.name}>
+                {p.name}
+              </option>
+            ))}
+          </select>
+          <input
+            className={input}
+            placeholder="Foreman"
+            value={foreman}
+            onChange={(e) => setForeman(e.target.value)}
+          />
+          <input
+            className={input}
+            type="date"
+            value={transferDate}
+            onChange={(e) => setTransferDate(e.target.value)}
+          />
+          <button
+            className={btnGold}
+            disabled={saveTransfer.isPending}
+            onClick={() => saveTransfer.mutate()}
+          >
+            <Plus size={15} />
+            Request transfer
+          </button>
+        </div>
+        <input
+          className={input}
+          placeholder="Reason (optional)"
+          value={transferReason}
+          onChange={(e) => setTransferReason(e.target.value)}
+        />
+        <div className="max-h-56 space-y-2 overflow-auto">
+          {(transfers.data ?? []).map((request) => (
+            <div
+              key={request.id}
+              className="flex flex-wrap items-center gap-2 rounded-lg border border-border p-3 text-xs"
+            >
+              <b className="text-navy">
+                {employees.find((employee) => employee.id === request.employee_id)?.name ??
+                  `Employee ${request.employee_id}`}
+              </b>
+              <span>
+                {request.from_site || "Unknown"} → {request.to_site}
+              </span>
+              <span>{request.effective_on}</span>
+              <span className="font-bold">{request.status}</span>
+              {isAdmin && request.status === "PENDING" && (
+                <>
+                  <button
+                    className={btnOutline}
+                    onClick={() => reviewTransfer.mutate({ id: request.id, status: "APPROVED" })}
+                  >
+                    <Check size={14} />
+                    Approve
+                  </button>
+                  <button
+                    className={btnOutline}
+                    onClick={() => reviewTransfer.mutate({ id: request.id, status: "REJECTED" })}
+                  >
+                    <X size={14} />
+                    Reject
+                  </button>
+                </>
+              )}
+            </div>
+          ))}
+          {!transfers.data?.length && (
+            <p className="text-xs text-muted-foreground">No transfer requests yet.</p>
+          )}
+        </div>
+      </section>
+      <section className={card + " space-y-4 p-4"}>
+        <h3 className="flex items-center gap-2 font-bold text-navy">
+          <ArrowLeftRight size={17} />
+          Site assignment history
+        </h3>
+        {isAdmin && (
+          <div className="space-y-3 rounded-xl border border-gold/40 bg-gold/5 p-4">
+            <div>
+              <h4 className="font-bold text-navy">Assign multiple employees to a site</h4>
+              <p className="mt-1 text-xs text-muted-foreground">
+                Move existing employees without creating duplicate employee records. Previous site
+                assignments stay in the history; the new assignment starts on the selected date.
+              </p>
+            </div>
+            <div className="grid gap-3 sm:grid-cols-2">
+              <select
+                className={select}
+                value={assignmentProjectId}
+                onChange={(event) => setAssignmentProjectId(event.target.value)}
+                aria-label="Select destination site"
+              >
+                <option value="">Select destination site</option>
+                {(projects.data ?? []).map((project) => (
+                  <option key={project.id} value={project.id}>
+                    {project.name}
+                    {project.code ? ` · ${project.code}` : ""}
+                  </option>
+                ))}
+              </select>
+              <input
+                className={input}
+                type="date"
+                value={assignmentDate}
+                onChange={(event) => setAssignmentDate(event.target.value)}
+                aria-label="Assignment effective date"
+              />
+            </div>
+            {projects.isLoading ? (
+              <p className="text-sm text-muted-foreground">Loading active sites…</p>
+            ) : projects.data?.length === 0 ? (
+              <p className="rounded-lg border border-gold/40 bg-background p-3 text-sm text-muted-foreground">
+                No active sites are available. Add or activate a project in Management first.
+              </p>
+            ) : (
+              <>
+                <div className="flex flex-wrap items-center gap-2">
+                  <div className="relative min-w-52 flex-1">
+                    <Search
+                      size={15}
+                      className="pointer-events-none absolute left-3 top-1/2 -translate-y-1/2 text-slate-400"
+                    />
+                    <input
+                      className={input + " pl-9"}
+                      value={assignmentSearch}
+                      onChange={(event) => setAssignmentSearch(event.target.value)}
+                      placeholder="Search active employees…"
+                      aria-label="Search employees for site assignment"
+                    />
+                  </div>
+                  <button
+                    type="button"
+                    className={btnOutline}
+                    disabled={visibleEmployeeIds.length === 0}
+                    onClick={() =>
+                      setAssignmentEmployeeIds((selected) =>
+                        allVisibleEmployeesSelected
+                          ? selected.filter((id) => !visibleEmployeeIds.includes(id))
+                          : [...new Set([...selected, ...visibleEmployeeIds])],
+                      )
+                    }
+                  >
+                    {allVisibleEmployeesSelected ? "Clear visible" : "Select visible"}
+                  </button>
+                </div>
+                <div className="max-h-60 overflow-y-auto rounded-lg border border-border bg-background">
+                  {activeEmployees.length === 0 ? (
+                    <p className="p-3 text-sm text-muted-foreground">
+                      No active employees match this search.
+                    </p>
+                  ) : (
+                    activeEmployees.map((employee) => {
+                      const id = String(employee.id);
+                      const checked = assignmentEmployeeIds.includes(id);
+                      return (
+                        <label
+                          key={employee.id}
+                          className="flex cursor-pointer items-center gap-3 border-b border-border p-3 last:border-b-0 hover:bg-navy-soft"
+                        >
+                          <input
+                            type="checkbox"
+                            checked={checked}
+                            onChange={() =>
+                              setAssignmentEmployeeIds((selected) =>
+                                checked
+                                  ? selected.filter((selectedId) => selectedId !== id)
+                                  : [...selected, id],
+                              )
+                            }
+                            className="size-4 accent-navy"
+                          />
+                          <span className="min-w-0 flex-1 truncate text-sm font-semibold text-foreground">
+                            {employee.name}
+                            <span className="ml-2 font-normal text-muted-foreground">
+                              {employee.trade}
+                            </span>
+                          </span>
+                          <span className="text-right text-xs text-muted-foreground">
+                            {currentSiteByEmployee.get(employee.id) ?? "No current site"}
+                          </span>
+                        </label>
+                      );
+                    })
+                  )}
+                </div>
+                <div className="flex flex-wrap items-center justify-between gap-3">
+                  <p className="text-xs text-muted-foreground">
+                    {assignmentEmployeeIds.length} employee
+                    {assignmentEmployeeIds.length === 1 ? "" : "s"} selected
+                    {projects.data?.find((project) => project.id === assignmentProjectId)
+                      ?.foreman_user_id
+                      ? " · Uses the selected site's configured foreman"
+                      : ""}
+                  </p>
+                  <button
+                    type="button"
+                    className={btnGold}
+                    disabled={
+                      assignEmployees.isPending ||
+                      !assignmentProjectId ||
+                      assignmentEmployeeIds.length === 0 ||
+                      !assignmentDate
+                    }
+                    onClick={() => assignEmployees.mutate()}
+                  >
+                    <BriefcaseBusiness size={15} />
+                    {assignEmployees.isPending
+                      ? "Assigning…"
+                      : `Assign ${assignmentEmployeeIds.length || ""} to site`}
+                  </button>
+                </div>
+              </>
+            )}
+          </div>
+        )}
+        <p className="text-xs text-muted-foreground">
+          Current recorded assignment:{" "}
+          {selectedEmployee
+            ? (currentAssignment.find((a) => a.employee_id === selectedEmployee.id)?.site ??
+              "Unknown")
+            : "Select an employee above"}
+        </p>
+        <div className="max-h-48 overflow-auto rounded-lg border border-border">
+          <table className="w-full text-left text-xs">
+            <thead className="bg-navy-soft">
+              <tr>
+                <th className="p-2">Employee</th>
+                <th className="p-2">Site</th>
+                <th className="p-2">Foreman</th>
+                <th className="p-2">From</th>
+                <th className="p-2">To</th>
+              </tr>
+            </thead>
+            <tbody>
+              {(assignments.data ?? []).map((a) => (
+                <tr key={a.id} className="border-t border-border">
+                  <td className="p-2">
+                    {employees.find((e) => e.id === a.employee_id)?.name ??
+                      `Employee ${a.employee_id}`}
+                  </td>
+                  <td className="p-2">{a.site}</td>
+                  <td className="p-2">{a.foreman || "—"}</td>
+                  <td className="p-2">{a.effective_from}</td>
+                  <td className="p-2">{a.effective_to ?? "Current"}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      </section>
+      <section className={card + " space-y-4 p-4"}>
+        <h3 className="flex items-center gap-2 font-bold text-navy">
+          <CalendarHeart size={17} />
+          Leave tracking
+        </h3>
+        <p className="rounded-lg bg-gold/10 p-3 text-xs text-warn">
+          Leave is recorded and approved here. Payroll treatment is manual per batch; approval does
+          not silently alter wages.
+        </p>
+        <div className="grid gap-3 sm:grid-cols-4">
+          <input
+            className={input}
+            placeholder="New leave type"
+            value={leaveTypeName}
+            onChange={(e) => setLeaveTypeName(e.target.value)}
+          />
+          <input
+            className={input}
+            type="number"
+            min="0"
+            step="0.5"
+            placeholder="Annual days (optional)"
+            value={leaveEntitlement}
+            onChange={(e) => setLeaveEntitlement(e.target.value)}
+          />
+          <select
+            className={select}
+            value={leaveTreatment}
+            onChange={(e) => setLeaveTreatment(e.target.value as LeaveType["payroll_treatment"])}
+          >
+            <option value="MANUAL">Manual per payroll batch</option>
+          </select>
+          <button
+            className={btnOutline}
+            disabled={saveLeaveType.isPending}
+            onClick={() => saveLeaveType.mutate()}
+          >
+            <Plus size={15} />
+            Add leave type
+          </button>
+        </div>
+        <div className="grid gap-3 sm:grid-cols-4">
+          <select
+            className={select}
+            value={employeeId}
+            onChange={(e) => setEmployeeId(e.target.value)}
+          >
+            <option value="">Select employee</option>
+            {employees.map((e) => (
+              <option key={e.id} value={e.id}>
+                {e.name}
+              </option>
+            ))}
+          </select>
+          <select
+            className={select}
+            value={leaveTypeId}
+            onChange={(e) => setLeaveTypeId(e.target.value)}
+          >
+            <option value="">Leave type</option>
+            {(leaveTypes.data ?? [])
+              .filter((t) => t.active)
+              .map((t) => (
+                <option key={t.id} value={t.id}>
+                  {t.name} · {t.payroll_treatment}
+                </option>
+              ))}
+          </select>
+          <input
+            className={input}
+            type="date"
+            value={leaveStart}
+            onChange={(e) => setLeaveStart(e.target.value)}
+          />
+          <input
+            className={input}
+            type="date"
+            value={leaveEnd}
+            onChange={(e) => setLeaveEnd(e.target.value)}
+          />
+          <input
+            className={input}
+            type="number"
+            min="0.5"
+            step="0.5"
+            placeholder="Days"
+            value={leaveDays}
+            onChange={(e) => setLeaveDays(e.target.value)}
+          />
+          <input
+            className={input + " sm:col-span-2"}
+            placeholder="Reason"
+            value={leaveReason}
+            onChange={(e) => setLeaveReason(e.target.value)}
+          />
+          <button
+            className={btnGold}
+            disabled={submitLeave.isPending}
+            onClick={() => submitLeave.mutate()}
+          >
+            <Plus size={15} />
+            Submit leave
+          </button>
+        </div>
+        <div className="max-h-60 space-y-2 overflow-auto">
+          {(leaveRequests.data ?? []).map((r) => {
+            const type = leaveTypes.data?.find((t) => t.id === r.leave_type_id);
+            const key = `${r.employee_id}:${r.leave_type_id}:${r.start_date.slice(0, 4)}`;
+            const used = approvedDays.get(key) ?? 0;
+            const remaining =
+              type?.annual_entitlement_days == null
+                ? null
+                : Math.max(0, Number(type.annual_entitlement_days) - used);
+            return (
+              <div
+                key={r.id}
+                className="flex flex-wrap items-center gap-2 rounded-lg border border-border p-3 text-xs"
+              >
+                <b className="text-navy">
+                  {employees.find((e) => e.id === r.employee_id)?.name ??
+                    `Employee ${r.employee_id}`}
+                </b>
+                <span>{type?.name ?? "Leave"}</span>
+                <span>
+                  {r.start_date} → {r.end_date} · {r.requested_days} day(s)
+                </span>
+                <span>
+                  {remaining == null ? "Balance not configured" : `${remaining} day(s) remaining`}
+                </span>
+                <span className="font-bold">{r.status}</span>
+                {isAdmin && r.status === "PENDING" && (
+                  <>
+                    <button
+                      className={btnOutline}
+                      onClick={() => reviewLeave.mutate({ id: r.id, status: "APPROVED" })}
+                    >
+                      <Check size={14} />
+                      Approve
+                    </button>
+                    <button
+                      className={btnOutline}
+                      onClick={() => reviewLeave.mutate({ id: r.id, status: "REJECTED" })}
+                    >
+                      <X size={14} />
+                      Reject
+                    </button>
+                  </>
+                )}
+              </div>
+            );
+          })}
+          {!leaveRequests.data?.length && (
+            <p className="text-xs text-muted-foreground">No leave requests yet.</p>
+          )}
+        </div>
+      </section>
+    </div>
+  );
+}
